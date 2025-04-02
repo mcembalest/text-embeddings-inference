@@ -10,6 +10,7 @@ mod jina;
 mod jina_code;
 mod mistral;
 mod nomic;
+mod nvembed;
 
 #[cfg(feature = "cuda")]
 mod flash_bert;
@@ -28,8 +29,12 @@ mod flash_distilbert;
 
 #[cfg(feature = "cuda")]
 mod flash_gte;
+
 #[cfg(feature = "cuda")]
 mod flash_mistral;
+
+#[cfg(feature = "cuda")]
+mod flash_nvembed;
 
 #[cfg(feature = "cuda")]
 mod flash_qwen2;
@@ -47,6 +52,7 @@ pub use jina_code::JinaCodeBertModel;
 pub use mistral::MistralConfig;
 pub use mpnet::{MPNetConfig, MPNetModel};
 pub use nomic::{NomicBertModel, NomicConfig};
+pub use nvembed::NVEmbedConfig;
 pub use qwen2::Qwen2Config;
 use text_embeddings_backend_core::Batch;
 
@@ -73,6 +79,9 @@ pub use flash_gte::FlashGTEModel;
 
 #[cfg(feature = "cuda")]
 pub use flash_qwen2::FlashQwen2Model;
+
+#[cfg(feature = "cuda")]
+pub use flash_nvembed::FlashNVEmbedModel;
 
 pub(crate) trait Model {
     fn is_padded(&self) -> bool;
