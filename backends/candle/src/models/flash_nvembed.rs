@@ -454,20 +454,42 @@ impl CrossAttention {
         
         let (k, v) = kv.chunk(2, -1)?;
         
-        // Reshape to separate the heads
-        let (b, n, _) = x.dims3()?;
-        let head_dim = q.dim(2)? / self.heads;
+        // Safely get dimensions
+        let x_dims = x.dims();
+        let k_dims = k.dims();
         
-        let q = q.reshape((b, n, self.heads, head_dim))?.permute((0, 2, 1, 3))?; // [b, h, n, d]
-        let k = k.reshape((b, k.dim(1)?, self.heads, head_dim))?.permute((0, 2, 1, 3))?; // [b, h, m, d]
-        let v = v.reshape((b, v.dim(1)?, self.heads, head_dim))?.permute((0, 2, 1, 3))?; // [b, h, m, d]
+        if x_dims.len() != 3 || k_dims.len() != 3 {
+            return Err(candle::Error::Msg(format!(
+                "Expected 3D tensors for attention, got x: {:?}, k: {:?}",
+                x_dims, k_dims
+            )).into());
+        }
         
-        // Scaled dot-product attention
-        let attn_weights = (q.matmul(&k.transpose(2, 3)?)? * self.scale)?;
-        let attn_weights = attn_weights.softmax(3)?; // softmax along seq_len_k
+        let batch_size = x_dims[0];
+        let seq_len_q = x_dims[1];
+        let seq_len_k = k_dims[1];
+        let head_dim = q.dim(-1)? / self.heads;
         
-        let context = attn_weights.matmul(&v)?; // [b, h, n, d]
-        let context = context.permute((0, 2, 1, 3))?.reshape((b, n, -1))?; // [b, n, h*d]
+        // Reshape and permute in a single view if possible
+        // Process query, key, and value in parallel for better efficiency
+        let q = q.reshape((batch_size, seq_len_q, self.heads, head_dim))?
+                 .permute((0, 2, 1, 3))?; // [b, h, n, d]
+        let k = k.reshape((batch_size, seq_len_k, self.heads, head_dim))?
+                 .permute((0, 2, 1, 3))?; // [b, h, m, d]
+        let v = v.reshape((batch_size, seq_len_k, self.heads, head_dim))?
+                 .permute((0, 2, 1, 3))?; // [b, h, m, d]
+        
+        // Compute attention scores and apply softmax in one step if possible
+        let k_t = k.transpose(2, 3)?;
+        let attn_weights = q.matmul(&k_t)? * self.scale;
+        let attn_probs = attn_weights.softmax(3)?; // softmax along seq_len_k
+        
+        // Apply attention and reshape back
+        let context = attn_probs.matmul(&v)?; // [b, h, n, d]
+        
+        // Combined permute and reshape for final projection
+        let context = context.permute((0, 2, 1, 3))?
+                             .reshape((batch_size, seq_len_q, -1))?; // [b, n, h*d]
         
         self.to_out.forward(&context)
     }
@@ -527,14 +549,34 @@ impl LatentAttentionModel {
     fn forward(&self, hidden_states: &Tensor, attention_mask: Option<&Tensor>) -> Result<Tensor> {
         let _enter = self.span.enter();
         
-        let (batch_size, seq_len, _) = hidden_states.dims3()?;
+        // Validate input dimensions
+        if hidden_states.dims().len() != 3 {
+            return Err(candle::Error::Msg(format!(
+                "Expected 3D tensor for hidden_states, got shape: {:?}",
+                hidden_states.shape()
+            )).into());
+        }
+        
+        let (batch_size, seq_len, hidden_dim) = hidden_states.dims3()?;
+        
+        // Check dimensions against config
+        if hidden_dim != self.latents.dim(1)? {
+            return Err(candle::Error::Msg(format!(
+                "Hidden dimension mismatch: got {}, expected {}",
+                hidden_dim, self.latents.dim(1)?
+            )).into());
+        }
         
         // Repeat latents for each item in batch
         let x = self.latents.repeat((batch_size, 1, 1))?;
         
         // Cross attention block
         let (normed_x, normed_context) = self.cross_attend_norm.forward(&x, Some(hidden_states))?;
-        let cross_attn = self.cross_attention.forward(&normed_x, normed_context.as_ref().unwrap())?;
+        let cross_attn = match normed_context {
+            Some(ctx) => self.cross_attention.forward(&normed_x, ctx)?,
+            None => return Err(candle::Error::Msg("Missing context tensor in cross-attention".to_string()).into())
+        };
+        
         let x = (x + cross_attn)?;
         
         // Feed forward block
@@ -544,18 +586,31 @@ impl LatentAttentionModel {
         
         // Mean pooling with attention mask if provided
         if let Some(mask) = attention_mask {
+            // Validate mask dimensions
+            if mask.dims().len() != 1 && mask.dim(0)? != batch_size * seq_len {
+                return Err(candle::Error::Msg(format!(
+                    "Invalid attention mask shape: expected ({},), got {:?}",
+                    batch_size * seq_len, mask.shape()
+                )).into());
+            }
+            
             // Expand the mask to match hidden dimensions
             let mask_expanded = mask.unsqueeze(-1)?.to_dtype(self.latents.dtype()?)?;
             
-            // Apply mask and compute masked mean
-            let sum = (hidden_states * mask_expanded)?.sum(1)?;
+            // Apply mask and compute masked mean on the output tensor
+            let sum = (output * mask_expanded)?.sum(1)?;
             let mask_sum = mask.sum_keepdim(1)?.to_dtype(self.latents.dtype()?)?;
-            let mean = (sum / mask_sum)?;
+            
+            // Avoid division by zero
+            let eps = 1e-9;
+            let safe_mask_sum = (mask_sum + eps)?;
+            let mean = (sum / safe_mask_sum)?;
             
             // Normalize if required
             if self.output_normalize {
                 let norm = mean.sqr()?.sum_keepdim(1)?.sqrt()?;
-                (mean / norm)?
+                let safe_norm = (norm + eps)?;
+                (mean / safe_norm)?
             } else {
                 mean
             }
@@ -565,8 +620,10 @@ impl LatentAttentionModel {
             
             // Normalize if required
             if self.output_normalize {
+                let eps = 1e-9;
                 let norm = mean.sqr()?.sum_keepdim(1)?.sqrt()?;
-                (mean / norm)?
+                let safe_norm = (norm + eps)?;
+                (mean / safe_norm)?
             } else {
                 mean
             }
@@ -625,6 +682,24 @@ impl FlashNVEmbedModel {
         })
     }
 
+    // Helper method to detect instruction tokens for masking
+    fn get_instruction_mask(&self, batch: &Batch) -> Result<Option<Vec<u32>>> {
+        // If instruction masking is not enabled, return None
+        if !self.is_mask_instruction {
+            return Ok(None);
+        }
+        
+        // In a real implementation, this would parse the batch to identify instruction tokens
+        // For now, we'll return None, indicating no instruction tokens were detected
+        // A proper implementation would need to:
+        // 1. Detect special instruction tokens or patterns
+        // 2. Calculate instruction lengths for each sequence
+        // 3. Create a mask that zeros out instruction tokens
+        
+        // TODO: Implement actual instruction detection
+        Ok(None)
+    }
+
     pub fn forward(&self, batch: Batch) -> Result<(Option<Tensor>, Option<Tensor>)> {
         let _enter = self.span.enter();
 
@@ -645,9 +720,25 @@ impl FlashNVEmbedModel {
             &self.device,
         )?;
 
-        // Create pool_mask - This would handle the instruction masking in a real implementation
-        // For now, we'll use the normal attention mask since we don't have instruction tokens
-        let pool_mask = attention_mask.clone();
+        // Create pool_mask for instruction masking
+        let pool_mask = match self.get_instruction_mask(&batch)? {
+            Some(instruction_mask) => {
+                // If we have instruction mask information, apply it
+                let instruction_mask_tensor = Tensor::from_vec(
+                    instruction_mask,
+                    shape,
+                    &self.device,
+                )?;
+                
+                // Apply the instruction mask to the attention mask
+                // This will zero out instruction tokens in the pooling mask
+                (attention_mask * instruction_mask_tensor)?
+            },
+            None => {
+                // Otherwise, use the standard attention mask
+                attention_mask.clone()
+            }
+        };
 
         // Run the embedding model (BidirectionalMistral)
         let hidden_states = self.embedding_model.forward(
