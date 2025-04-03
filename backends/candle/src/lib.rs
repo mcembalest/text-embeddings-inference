@@ -65,6 +65,8 @@ enum Config {
     Qwen2(Qwen2Config),
     #[serde(rename = "mpnet")]
     MPNet(MPNetConfig),
+    #[serde(rename(deserialize = "nvembed"))]
+    NVEmbed(NVEmbedConfig),
 }
 
 pub struct CandleBackend {
@@ -376,7 +378,26 @@ impl CandleBackend {
                 Ok(Box::new(
                     FlashQwen2Model::load(vb, &config, model_type).s()?,
                 ))
-            }
+            },
+            
+            #[cfg(feature = "cuda")]
+            (Config::NVEmbed(config), Device::Cuda(_)) => {
+                if dtype != DType::F16
+                    || !cfg!(feature = "flash-attn")
+                    || get_runtime_compute_cap().unwrap() < 80
+                {
+                    return Err(BackendError::Start("NVEmbed is only supported on Cuda devices in fp16 with flash attention v2 enabled".to_string()));
+                }
+                tracing::info!("Starting FlashNVEmbed model on {:?}", device);
+                Ok(Box::new(
+                    FlashNVEmbedModel::load(vb, &config, model_type).s()?,
+                ))
+            },
+            
+            (Config::NVEmbed(_), Device::Cpu | Device::Metal(_)) => Err(BackendError::Start(
+                "NVEmbed is only supported on Cuda devices in fp16 with flash attention enabled"
+                    .to_string(),
+            ))
         };
 
         Ok(Self {
